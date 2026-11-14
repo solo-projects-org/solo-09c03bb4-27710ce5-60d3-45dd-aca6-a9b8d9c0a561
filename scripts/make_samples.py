@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成三类演示样例：正常、错配、超限。
+"""生成演示样例：正常、错配、超限、损坏、低质量尾（用于裁剪演示）。
 
 用法:
     python scripts/make_samples.py [输出目录]
@@ -9,6 +9,7 @@
     mismatch/R1.fastq.gz mismatch/R2.fastq.gz    # R2 第 2 条读段名与 R1 不一致
     oversized/R1.fastq.gz oversized/R2.fastq.gz  # 展开后远超 64 MiB 上限
     corrupt/R1.fastq.gz                          # 损坏的 gzip（截断）
+    lowqual/R1.fastq.gz  lowqual/R2.fastq.gz     # 尾部低质量，供质量裁剪演示
 """
 
 from __future__ import annotations
@@ -46,6 +47,26 @@ def _write_pair(directory: Path, count: int, *, mismatch_at: int | None = None) 
             f2.write(r2)
 
 
+def _write_lowqual(directory: Path, count: int = 200, length: int = 80) -> None:
+    """尾部低质量样例：主体 'J'(Q41)，尾部 '!'(Q0)。
+
+    常规对尾部 18 个低质量碱基；每第 5 对尾部 45 个，裁剪后不足最短读长 50，
+    用于演示「任一端不足最短读长则舍弃整对」。
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    with gzip.open(directory / "R1.fastq.gz", "wb") as f1, gzip.open(
+        directory / "R2.fastq.gz", "wb"
+    ) as f2:
+        for i in range(count):
+            tail = 45 if i % 5 == 0 else 18
+            seq1 = bytes(65 + (j * 7 + i) % 26 for j in range(length))
+            seq2 = bytes(65 + (j * 11 + i) % 26 for j in range(length))
+            qual = b"J" * (length - tail) + b"!" * tail
+            base = f"lowqual-seq-{i:06d}".encode()
+            f1.write(_record(base + b"/1", seq1, qual))
+            f2.write(_record(base + b"/2", seq2, qual))
+
+
 def main(out: Path) -> None:
     # 1) 正常样例：1000 对，约 330 KB 展开数据
     _write_pair(out / "normal", 1000)
@@ -67,6 +88,9 @@ def main(out: Path) -> None:
     blob = tmp_gz.read_bytes()
     tmp_gz.unlink()
     (corrupt_dir / "R1.fastq.gz").write_bytes(blob[: len(blob) // 2])
+
+    # 5) 低质量尾样例：200 对，供质量裁剪演示（含会被整对舍弃的记录）
+    _write_lowqual(out / "lowqual")
 
     for path in sorted(out.rglob("*.gz")):
         print(f"{path.relative_to(out)}  {os.path.getsize(path)} bytes")

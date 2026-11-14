@@ -31,6 +31,32 @@ CREATE TABLE IF NOT EXISTS files (
     uploaded_at TEXT NOT NULL,
     UNIQUE(batch_id, role)
 );
+
+CREATE TABLE IF NOT EXISTS trim_jobs (
+    id           TEXT PRIMARY KEY,
+    batch_id     TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    min_quality  INTEGER NOT NULL,
+    min_length   INTEGER NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('running','published','failed')),
+    error        TEXT,
+    pairs_in     INTEGER,
+    pairs_kept   INTEGER,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+-- 每批至多一行的「当前已发布裁剪结果包」指针；新包完整落库后才切换
+CREATE TABLE IF NOT EXISTS trim_packages (
+    batch_id     TEXT PRIMARY KEY REFERENCES batches(id) ON DELETE CASCADE,
+    job_id       TEXT NOT NULL,
+    path         TEXT NOT NULL,
+    min_quality  INTEGER NOT NULL,
+    min_length   INTEGER NOT NULL,
+    pairs_in     INTEGER NOT NULL,
+    pairs_kept   INTEGER NOT NULL,
+    size         INTEGER NOT NULL,
+    published_at TEXT NOT NULL
+);
 """
 
 _INIT_LOCK = threading.Lock()

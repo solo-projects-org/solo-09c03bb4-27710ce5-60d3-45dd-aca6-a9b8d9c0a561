@@ -159,6 +159,84 @@ def test_full_lifecycle_normal_mismatch_oversized(server):
     assert list((server["data_dir"] / "batches" / big_id).iterdir()) == []
 
 
+def test_trim_lifecycle_and_failure_retention(server):
+    """真实服务器上的裁剪全流程：放行→裁剪→下载→失败保留旧包→重算成功。"""
+    # 8 对记录：尾部 6 个碱基低质量（'!'=Q0），主体高质量（'J'=Q41）
+    r1, r2 = [], []
+    for i in range(8):
+        seq = bytes(65 + (i * 5 + j) % 26 for j in range(40))
+        qual = b"J" * 34 + b"!" * 6
+        r1.append((f"trim-itg-{i}/1".encode(), seq, qual))
+        r2.append((f"trim-itg-{i}/2".encode(), seq, qual))
+
+    _, body = _req(server, "POST", "/batches", json.dumps({"sample_id": "itg-trim"}).encode(),
+                   {"Content-Type": "application/json"})
+    bid = body["id"]
+    assert _req(server, "POST", f"/batches/{bid}/files/R1", _make_gz(r1),
+                {"Content-Type": "application/gzip"})[0] == 200
+    code, body = _req(server, "POST", f"/batches/{bid}/files/R2", _make_gz(r2),
+                      {"Content-Type": "application/gzip"})
+    assert code == 200 and body["status"] == "ready"
+
+    with urllib.request.urlopen(server["base"] + f"/batches/{bid}/files/R1/download") as dl:
+        original_r1 = dl.read()
+
+    def post_trim(min_quality, min_length):
+        return _req(server, "POST", f"/batches/{bid}/trim",
+                    json.dumps({"min_quality": min_quality, "min_length": min_length}).encode(),
+                    {"Content-Type": "application/json"})
+
+    def wait_done():
+        for _ in range(100):
+            _, st = _req(server, "GET", f"/batches/{bid}/trim")
+            if st["job"] and st["job"]["status"] != "running":
+                return st
+            time.sleep(0.1)
+        raise AssertionError("trim job did not finish")
+
+    def download_trimmed(role="R1"):
+        with urllib.request.urlopen(
+            server["base"] + f"/batches/{bid}/trim/files/{role}/download"
+        ) as dl:
+            return dl.read()
+
+    # 1) 正常裁剪：尾部 6 个低质量碱基被裁去
+    code, body = post_trim(30, 20)
+    assert code == 202 and body["job"]["status"] == "running"
+    st = wait_done()
+    assert st["job"]["status"] == "published" and st["job"]["pairs_kept"] == 8
+    trimmed = download_trimmed()
+    first_rec = trimmed.split(b"\n")[:4]
+    assert first_rec[0] == b"@trim-itg-0/1"
+    assert len(first_rec[1]) == 34 and set(first_rec[3]) == {ord("J")}
+    # 原始文件与批次状态不变
+    with urllib.request.urlopen(server["base"] + f"/batches/{bid}/files/R1/download") as dl:
+        assert dl.read() == original_r1
+    _, detail = _req(server, "GET", f"/batches/{bid}")
+    assert detail["status"] == "ready"
+
+    # 2) 失败保留：最短读长超过原读长 → 无读对存活 → 任务失败，旧包仍可下载
+    code, _ = post_trim(30, 100)
+    assert code == 202
+    st = wait_done()
+    assert st["job"]["status"] == "failed" and "no read pairs survived" in st["job"]["error"]
+    assert download_trimmed() == trimmed
+    # 中间文件已清理，只留已发布包
+    trim_dir = server["data_dir"] / "batches" / bid / "trim"
+    survivors = [p.name for p in trim_dir.iterdir()]
+    assert survivors == [f"pkg-{st['package']['job_id']}"]
+
+    # 3) 调整阈值重算成功，新包替换旧包
+    code, _ = post_trim(0, 20)
+    assert code == 202
+    st = wait_done()
+    assert st["job"]["status"] == "published"
+    republished = download_trimmed()
+    assert len(republished) > len(trimmed)  # 阈值为 0 时低质量尾保留，读长恢复 40
+    survivors = [p.name for p in trim_dir.iterdir()]
+    assert survivors == [f"pkg-{st['package']['job_id']}"]
+
+
 def test_slow_upload_does_not_block_other_batch(server):
     r1, r2 = _pair(4)
     _, body = _req(server, "POST", "/batches", json.dumps({"sample_id": "slow"}).encode(),

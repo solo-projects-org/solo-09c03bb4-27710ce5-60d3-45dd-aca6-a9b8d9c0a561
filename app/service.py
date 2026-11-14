@@ -1,15 +1,17 @@
-"""批次生命周期服务：创建、上传校验、取消、回收、重启恢复。"""
+"""批次生命周期服务：创建、上传校验、取消、回收、重启恢复、质量裁剪。"""
 
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import uuid
 from pathlib import Path
 
 from fastapi import HTTPException
 
 from .database import get_conn, init_db
-from .models import BatchStatus, FileRole, utcnow_iso
+from .models import BatchStatus, FileRole, TrimJobStatus, utcnow_iso
 from .storage import (
     BatchRegistry,
     QuotaExceededError,
@@ -17,6 +19,7 @@ from .storage import (
     directory_size,
     remove_batch_files,
 )
+from .trimming import TrimError, trim_fastq_pair
 from .validation import StreamError, stream_gunzip, validate_fastq_pair, validate_fastq_structure
 
 TERMINAL_STATUSES = {BatchStatus.READY.value, BatchStatus.FAILED.value, BatchStatus.CANCELLED.value}
@@ -41,6 +44,9 @@ class BatchService:
 
     def _fastq_path(self, batch_id: str, role: FileRole) -> Path:
         return self._dir(batch_id) / f"{role.value}.fastq"
+
+    def _trim_dir(self, batch_id: str) -> Path:
+        return self._dir(batch_id) / "trim"
 
     # ------------------------------------------------------------------ #
     # DB 小工具
@@ -277,25 +283,228 @@ class BatchService:
         return path, f"{row['sample_id']}_{role.value}.fastq"
 
     # ------------------------------------------------------------------ #
+    # 质量裁剪
+    # ------------------------------------------------------------------ #
+    def _latest_trim_job(self, batch_id: str) -> dict | None:
+        with get_conn(self.settings.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM trim_jobs WHERE batch_id = ?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (batch_id,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def _trim_package(self, batch_id: str) -> dict | None:
+        with get_conn(self.settings.db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM trim_packages WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    async def start_trim(self, batch_id: str, min_quality: int, min_length: int) -> dict:
+        """为 ready 批启动后台裁剪任务；同批只允许一项在途。"""
+        row = self._row(batch_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="batch not found")
+        if row["status"] != BatchStatus.READY.value:
+            raise HTTPException(
+                status_code=409,
+                detail=f"batch is {row['status']}, trim requires a ready batch",
+            )
+        r1 = self._fastq_path(batch_id, FileRole.R1)
+        r2 = self._fastq_path(batch_id, FileRole.R2)
+        if not r1.exists() or not r2.exists():
+            raise HTTPException(status_code=409, detail="original FASTQ files missing on disk")
+
+        runtime = await self.registry.create(batch_id)
+        # 同批只能有一项裁剪在途；检查与登记之间不 await，保证并发下原子
+        task = runtime.trim_task
+        if task is not None and not task.done():
+            raise HTTPException(
+                status_code=409, detail="a trim job is already running for this batch"
+            )
+        with get_conn(self.settings.db_path) as conn:
+            running = conn.execute(
+                "SELECT 1 FROM trim_jobs WHERE batch_id = ? AND status = ?",
+                (batch_id, TrimJobStatus.RUNNING.value),
+            ).fetchone()
+        if running:
+            raise HTTPException(
+                status_code=409, detail="a trim job is already running for this batch"
+            )
+
+        job_id = uuid.uuid4().hex
+        now = utcnow_iso()
+        with get_conn(self.settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO trim_jobs (id, batch_id, min_quality, min_length, status,"
+                " error, pairs_in, pairs_kept, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
+                (
+                    job_id, batch_id, min_quality, min_length,
+                    TrimJobStatus.RUNNING.value, now, now,
+                ),
+            )
+        runtime.trim_task = asyncio.create_task(
+            self._run_trim(batch_id, job_id, min_quality, min_length)
+        )
+        return self._latest_trim_job(batch_id)
+
+    async def _run_trim(self, batch_id: str, job_id: str, min_quality: int, min_length: int) -> None:
+        """后台裁剪：写 staging → 原子发布 → 失败/超限时保留旧包并清理中间文件。"""
+        bdir = self._dir(batch_id)
+        staging = self._trim_dir(batch_id) / f"staging-{job_id}"
+        pkg_dir = self._trim_dir(batch_id) / f"pkg-{job_id}"
+        old_pkg = self._trim_package(batch_id)
+        try:
+            pairs_in, pairs_kept = await trim_fastq_pair(
+                r1_path=self._fastq_path(batch_id, FileRole.R1),
+                r2_path=self._fastq_path(batch_id, FileRole.R2),
+                out_r1=staging / "R1.fastq",
+                out_r2=staging / "R2.fastq",
+                min_quality=min_quality,
+                min_length=min_length,
+                space=self.space,
+                batch_id=batch_id,
+            )
+            if pairs_kept == 0:
+                raise TrimError(
+                    f"no read pairs survived trimming (pairs_in={pairs_in}); loosen thresholds"
+                )
+            # 发布：staging 目录整体原子改名，随后落库切换「当前包」指针
+            await asyncio.to_thread(os.replace, staging, pkg_dir)
+            now = utcnow_iso()
+            size = await asyncio.to_thread(directory_size, pkg_dir)
+            with get_conn(self.settings.db_path) as conn:
+                conn.execute(
+                    "INSERT INTO trim_packages (batch_id, job_id, path, min_quality, min_length,"
+                    " pairs_in, pairs_kept, size, published_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(batch_id) DO UPDATE SET job_id=excluded.job_id,"
+                    " path=excluded.path, min_quality=excluded.min_quality,"
+                    " min_length=excluded.min_length, pairs_in=excluded.pairs_in,"
+                    " pairs_kept=excluded.pairs_kept, size=excluded.size,"
+                    " published_at=excluded.published_at",
+                    (batch_id, job_id, str(pkg_dir), min_quality, min_length,
+                     pairs_in, pairs_kept, size, now),
+                )
+                conn.execute(
+                    "UPDATE trim_jobs SET status = ?, pairs_in = ?, pairs_kept = ?,"
+                    " updated_at = ? WHERE id = ?",
+                    (TrimJobStatus.PUBLISHED.value, pairs_in, pairs_kept, now, job_id),
+                )
+            # 新包完整发布后旧包才删除；发布前旧包一直可下载
+            if old_pkg is not None and Path(old_pkg["path"]) != pkg_dir:
+                await asyncio.to_thread(shutil.rmtree, Path(old_pkg["path"]), True)
+        except QuotaExceededError as exc:
+            self._fail_trim_job(job_id, f"byte quota exceeded: {exc}")
+        except (TrimError, OSError) as exc:
+            self._fail_trim_job(job_id, str(exc))
+        except Exception as exc:  # 兜底：任何失败都不得弄丢旧包
+            self._fail_trim_job(job_id, f"trim failed: {exc}")
+        finally:
+            # 清理中间文件，按磁盘真实占用对账（保留的旧包/新包字节继续计入）
+            if staging.exists():
+                await asyncio.to_thread(shutil.rmtree, staging, True)
+            await self.space.set_batch_usage(batch_id, directory_size(bdir))
+            runtime = await self.registry.get(batch_id)
+            if runtime is not None and runtime.trim_task is asyncio.current_task():
+                runtime.trim_task = None
+
+    def _fail_trim_job(self, job_id: str, reason: str) -> None:
+        now = utcnow_iso()
+        with get_conn(self.settings.db_path) as conn:
+            conn.execute(
+                "UPDATE trim_jobs SET status = ?, error = ?, updated_at = ?"
+                " WHERE id = ? AND status = ?",
+                (
+                    TrimJobStatus.FAILED.value, reason[:2000], now, job_id,
+                    TrimJobStatus.RUNNING.value,
+                ),
+            )
+
+    async def get_trim_status(self, batch_id: str) -> dict:
+        row = self._row(batch_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="batch not found")
+        return {
+            "batch_id": batch_id,
+            "job": self._latest_trim_job(batch_id),
+            "package": self._trim_package(batch_id),
+        }
+
+    def trim_download_path(self, batch_id: str, role: FileRole) -> tuple[Path, str]:
+        row = self._row(batch_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="batch not found")
+        if row["status"] != BatchStatus.READY.value:
+            raise HTTPException(
+                status_code=409, detail=f"batch is {row['status']}, not downloadable"
+            )
+        pkg = self._trim_package(batch_id)
+        if pkg is None:
+            raise HTTPException(status_code=404, detail="no published trim package for this batch")
+        path = Path(pkg["path"]) / f"{role.value}.fastq"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail=f"trimmed {role.value} file missing on disk")
+        return path, f"{row['sample_id']}_trimmed_{role.value}.fastq"
+
+    # ------------------------------------------------------------------ #
     # 重启恢复
     # ------------------------------------------------------------------ #
+    async def _clean_trim_intermediates(self, batch_id: str, keep_pkg: str | None) -> int:
+        """删除批次 trim/ 下除当前已发布包之外的一切（staging 与未发布包）。"""
+        tdir = self._trim_dir(batch_id)
+        if not tdir.is_dir():
+            return 0
+        cleaned = 0
+        for child in tdir.iterdir():
+            if child.is_dir() and keep_pkg is not None and str(child) == keep_pkg:
+                continue
+            if child.is_dir():
+                await asyncio.to_thread(shutil.rmtree, child, True)
+            else:
+                try:
+                    child.unlink()
+                except FileNotFoundError:
+                    pass
+            cleaned += 1
+        return cleaned
+
     async def recover_on_startup(self) -> dict:
-        """通过批保留；未完成批（receiving）一律判失败并回收磁盘后再对外服务。"""
+        """通过批保留；未完成批（receiving）一律判失败并回收磁盘后再对外服务。
+
+        裁剪产物：重启时在途任务判失败，staging 与未发布包清理，已发布包保留。
+        """
         # 同一 service 实例只恢复一次，避免测试中多个 ASGI 客户端重跑 lifespan 误判在途批
         if self._recovered:
             return {"ready": 0, "aborted": 0, "orphaned": 0, "skipped": "already-recovered"}
         self._recovered = True
         self.settings.batch_dir.mkdir(parents=True, exist_ok=True)
-        recovered = {"ready": 0, "aborted": 0, "orphaned": 0}
+        recovered = {"ready": 0, "aborted": 0, "orphaned": 0, "trim_cleaned": 0}
 
         with get_conn(self.settings.db_path) as conn:
             rows = conn.execute("SELECT id, status FROM batches").fetchall()
             known = {r["id"]: r["status"] for r in rows}
+            # 重启时在途的裁剪任务一律判失败；已发布结果包保留
+            now = utcnow_iso()
+            conn.execute(
+                "UPDATE trim_jobs SET status = ?, error = ?, updated_at = ? WHERE status = ?",
+                (
+                    TrimJobStatus.FAILED.value, "interrupted by server restart", now,
+                    TrimJobStatus.RUNNING.value,
+                ),
+            )
+            pkg_rows = conn.execute("SELECT batch_id, path FROM trim_packages").fetchall()
+            referenced = {r["batch_id"]: r["path"] for r in pkg_rows}
 
         for batch_id, status in known.items():
             bdir = self._dir(batch_id)
             if status == BatchStatus.READY.value:
-                # 以磁盘真实文件为准重建配额账
+                # 先清理裁剪中间文件，再以磁盘真实文件为准重建配额账
+                recovered["trim_cleaned"] += await self._clean_trim_intermediates(
+                    batch_id, referenced.get(batch_id)
+                )
                 await self.space.set_batch_usage(batch_id, directory_size(bdir))
                 recovered["ready"] += 1
                 continue
@@ -308,6 +517,10 @@ class BatchService:
             else:
                 await asyncio.to_thread(remove_batch_files, bdir)
                 await self.space.remove_batch(batch_id)
+            # 非 ready 批不可能持有裁剪产物，防御性清掉关联行
+            with get_conn(self.settings.db_path) as conn:
+                conn.execute("DELETE FROM trim_jobs WHERE batch_id = ?", (batch_id,))
+                conn.execute("DELETE FROM trim_packages WHERE batch_id = ?", (batch_id,))
 
         # 磁盘上有目录但 DB 无记录的孤儿数据，直接回收
         for child in self.settings.batch_dir.iterdir():

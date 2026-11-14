@@ -15,6 +15,9 @@ from .schemas import (
     BatchListResponse,
     BatchResponse,
     CancelResponse,
+    TrimAcceptedResponse,
+    TrimRequest,
+    TrimStatusResponse,
 )
 from .service import BatchService
 
@@ -39,8 +42,11 @@ app = FastAPI(
         "测序双端数据按样本建批接收。R1、R2 各以请求体流式上传一次，"
         "单成员 gzip、严格四行制 FASTQ，两端条数与读段名逐对校验。"
         "坏包或校验失败整批拒收；单批文件字节上限接收过程中实时守限。"
+        "ready 批次可提交质量裁剪任务：按 Phred+33 阈值裁去两端尾部低质量碱基，"
+        "任一端不足最短读长则舍弃整对，结果以原子发布的结果包提供下载，"
+        "原始文件与批次状态不变，可调整阈值重算。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -86,6 +92,46 @@ async def cancel_batch(batch_id: str):
          summary="下载展开后的 R1 / R2 FASTQ（仅 ready 批次）")
 async def download_file(batch_id: str, role: FileRole):
     path, filename = service.download_path(batch_id, role)
+    return FileResponse(path, media_type="text/plain", filename=filename)
+
+
+@app.post(
+    "/batches/{batch_id}/trim",
+    response_model=TrimAcceptedResponse,
+    status_code=202,
+    tags=["trim"],
+    summary="为 ready 批次启动质量裁剪任务（后台执行，同批仅一项在途）",
+    responses={
+        409: {"description": "批次非 ready / 已有裁剪任务在途 / 原始文件缺失"},
+    },
+)
+async def start_trim(batch_id: str, payload: TrimRequest):
+    job = await service.start_trim(batch_id, payload.min_quality, payload.min_length)
+    return {"job": job, "message": "trim job accepted; poll GET /batches/{id}/trim for progress"}
+
+
+@app.get(
+    "/batches/{batch_id}/trim",
+    response_model=TrimStatusResponse,
+    tags=["trim"],
+    summary="查询最近一次裁剪任务状态与当前已发布结果包",
+    responses={404: {"description": "批次不存在"}},
+)
+async def get_trim(batch_id: str):
+    return await service.get_trim_status(batch_id)
+
+
+@app.get(
+    "/batches/{batch_id}/trim/files/{role}/download",
+    tags=["trim"],
+    summary="下载当前已发布结果包中的裁剪后 R1 / R2 FASTQ",
+    responses={
+        404: {"description": "批次不存在 / 尚无已发布结果包"},
+        409: {"description": "批次非 ready"},
+    },
+)
+async def download_trimmed_file(batch_id: str, role: FileRole):
+    path, filename = service.trim_download_path(batch_id, role)
     return FileResponse(path, media_type="text/plain", filename=filename)
 
 

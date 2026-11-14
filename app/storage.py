@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from pathlib import Path
 
 from .models import BatchRuntime
@@ -85,12 +86,17 @@ def directory_size(path: Path) -> int:
 
 
 def remove_batch_files(batch_dir: Path) -> int:
-    """删除批次目录下所有文件并返回释放的字节数。"""
+    """删除批次目录下所有内容（含裁剪 staging / 结果包子目录）并返回释放的字节数。"""
     freed = directory_size(batch_dir)
     if batch_dir.exists():
         for child in batch_dir.iterdir():
-            if child.is_file():
-                child.unlink()
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            elif child.is_file():
+                try:
+                    child.unlink()
+                except FileNotFoundError:
+                    pass
     return freed
 
 
